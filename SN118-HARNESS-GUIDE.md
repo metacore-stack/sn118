@@ -6,9 +6,24 @@
 > (`platform-api.heyditto.ai/api/v1/public/bench/config`), the public leaderboard API,
 > and four independent chain explorers.
 >
+> **Re-verified against live sources 2026-09-02 21:55–21:57 UTC.** Section 12, Appendix B and
+> the leaderboard snapshot were materially wrong before that pass; see Appendix E for what
+> changed.
+>
 > **Everything version-sensitive moves daily.** Re-read the bench config before acting on any
-> number here. Quotations from the repo are marked with `[repo]`; everything else marked
-> **Recommendation** is engineering judgement, not official guidance.
+> number here.
+>
+> **Provenance markers.** Every non-obvious claim carries one:
+>
+> | Marker | Means |
+> |---|---|
+> | `[repo]` | Quoted verbatim from the repository at the cited path. |
+> | `[live]` | Read from the platform API or chain during the verification pass. Reproducible now. |
+> | `[inferred]` | Reasoning from marked inputs. The arithmetic is shown. |
+> | `[unverified]` | No reachable source either way. Stated as a known hole, not a conclusion. |
+> | **Recommendation** | Engineering judgement, not official guidance. |
+>
+> An unmarked sentence is exposition. If it asserts a number, that is a bug — report it.
 
 ---
 
@@ -16,7 +31,7 @@
 
 - [0. Five facts that decide your architecture](#0-five-facts-that-decide-your-architecture)
 - [1. The contract](#1-the-contract)
-- [2. How you are scored](#2-how-you-are-scored)
+- [2. How you are scored](#2-how-you-are-scored)  ·  [2.3 integrity multipliers](#23-the-integrity-multipliers)  ·  [2.5 dethroning](#25-dethroning-and-emissions)
 - [3. Choosing your starting point](#3-choosing-your-starting-point)
 - [4. Target architecture](#4-target-architecture)
 - [5. Build sequence](#5-build-sequence)
@@ -31,6 +46,7 @@
 - [Appendix B — metrics dashboard](#appendix-b--metrics-dashboard)
 - [Appendix C — the documentation drift problem](#appendix-c--the-documentation-drift-problem)
 - [Appendix D — sources](#appendix-d--sources)
+- [Appendix E — what the verification pass changed](#appendix-e--what-the-verification-pass-changed)
 
 ---
 
@@ -46,17 +62,52 @@ The live bench config states the enforcement plainly:
 > `"enforcement": "ticket-scoped platform proxy forces the model and medium reasoning effort
 > and holds the upstream key outside the sandbox; sandbox egress is deny-all"` `[repo/api]`
 
-Exactly two holes exist in that boundary:
+**Three** holes exist in that boundary. Earlier revisions of this guide said two and omitted the
+embedding gateway; that error is worth understanding, because it makes you ship a model you are
+already being handed.
 
-| Hole | What it is |
-|---|---|
-| Platform model relay | Serves the locked `openai/gpt-oss-20b`. Your `DITTOBENCH_MODEL` is overridden. |
-| `tool_endpoint` | A validator-served mock tool executor, supplied per case in the `RunRequest`. |
+| Hole | What it is | How you reach it |
+|---|---|---|
+| Platform model relay | Serves the locked `openai/gpt-oss-20b`. Your `DITTOBENCH_MODEL` is overridden. | `DITTOBENCH_PROVIDER=platform`, URL injected as `DITTOBENCH_INFERENCE_BASE_URL` |
+| Embedding gateway | Serves the validator's embedder. See [§7.5](#75-two-distribution-shifts-you-must-plan-for). | URL injected over `OLLAMA_BASE_URL`, **Ollama** wire format (`/api/embed`) |
+| `tool_endpoint` | A validator-served mock tool executor, supplied per case in the `RunRequest`. | Per-case field in the `RunRequest` |
+
+**The model relay contract, in full.** This is the single most important thing the protocol docs
+do not state; it lives only in `miners/dittobench-starter-kit/src/baseline.rs`. `[repo]`
+
+```
+DITTOBENCH_PROVIDER=platform          # legacy alias: chutes
+DITTOBENCH_INFERENCE_BASE_URL=...     # injected by the validator
+Authorization: Bearer ticket          # literal string, not a secret
+```
+
+Speak **OpenAI-compatible chat completions** against that base URL. The reference kit pins
+`temperature: 0.0` and `seed: 42` for determinism. `RunRequest.inference_base_url` also exists on
+the wire, but the scorer no longer mints one and leaves the field empty — read the environment,
+not the request. `[repo]`
+
+> **If you are writing a greenfield harness, this paragraph is the whole ballgame.** A harness that
+> does not implement this has no model access at all and scores only what it can do without an
+> LLM. See [§3.2](#32-decision).
+
+**The embedding gateway matters more than it looks.** Any dense-retrieval design must embed the
+*query* at `/run` time, not just the corpus at `/seed` time. That is a network call on the hot
+path, inside the 60 s budget, under concurrency. Budget for it. And note the wire format: a
+harness that assumes OpenAI-shaped `/v1/embeddings` gets nothing. The starter kit's `.env.example`
+pre-empts the obvious guess — "`DITTOBENCH_EMBED_PROVIDER`, `DITTOBENCH_EMBED_MODEL`, and
+`DITTOBENCH_EMBED_BASE_URL` are not kit settings." `[repo]`
 
 **Consequences.** No model pull at runtime. No package fetch. No calling your own API. No
-downloading an index. Everything the harness needs must be baked into an image built from a
-**20 MiB** context. No API key of yours is ever used during scoring, so shipping one buys
+downloading an index. No API key of yours is ever used during scoring, so shipping one buys
 nothing and leaks it into an uploaded tarball.
+
+**What the 20 MiB cap does *not* constrain.** It caps the build *context*, not the image. `cargo
+fetch`, `pip install` and the `ort` crate's ONNX Runtime download all happen during `docker
+build`, so an arbitrarily large public dependency tree is fine. And the cap is not close to
+binding: the starter kit's entire shipped model payload measures **5.32 MiB** — cross-encoder
+4,476,244 B + vocab 231,508 B + MLP weights 867,972 B — leaving ~14 MiB unspent. `[repo]` The four
+projections in [§4.2](#42-layers) are code and schema, not weights. Size your artifact against the
+runtime box in [Stage 10](#stage-10--package-verify-and-only-then-pay), not against this number.
 
 ### 0.2 The trajectory that is graded is the one the validator observed
 
@@ -66,6 +117,15 @@ Self-reported `tool_calls` are not evidence. The validator serves the mock endpo
 every call, and grades that record. It also self-checks the endpoint before scoring, so "the
 listener was down" is not a failure mode you inherit — if the listener is healthy and you never
 call it, you simply get the zero.
+
+**The repo contradicts itself on the severity, and you should know which model you are debugging
+with.** `PROTOCOL.md` says *scores 0*; the generator's own wire contract says such cases are
+*capped*, and the telemetry field is literally named `capped_tool_cases`; the kit README adds a
+third phrasing scoped to v8 ("an unobserved observable case scores 0"). `[repo]` Neither reading
+changes the instruction — route every call through `tool_endpoint` — but it changes triage. Under
+"scores 0" a nonzero `capped_tool_cases` is catastrophic; under "capped" it is a recoverable
+ceiling on specific categories. Treat the harsher reading as your planning assumption and the
+milder one as your debugging hypothesis. The distinction is **`[unverified]`** for v12.
 
 ### 0.3 Grading is deterministic and judge-free
 
@@ -82,7 +142,7 @@ a case you would otherwise have passed.
 
 Accuracy is a mean. Integrity failures are multipliers applied to it. One of them is not
 symmetric with the others: leaking another user's planted nonce is a hard **×0.50** that no
-amount of good recall recovers. See [§2.3](#23-the-three-integrity-multipliers).
+amount of good recall recovers. See [§2.3](#23-the-integrity-multipliers).
 
 ### 0.5 The board reset because an exploit was closed, not because the problem is unsolved
 
@@ -92,9 +152,17 @@ The v12 spec is explicit about its own motivation:
 > fixed-order KV rows, fired a model call only to satisfy the attribution gate, and computed a
 > balance positionally." `[repo]`
 
-The current champion sits at ~0.78 on v12. Read that as *"the shortcut was removed six weeks
-ago"*, not *"nobody can do this"*. It also tells you exactly what earns points now: read prose,
-bind relationally, pick the program from the request, compute deterministically.
+The current champion sits at ~0.78 on v12. Read that as *"the shortcut was recently removed"*,
+not *"nobody can do this"*. It also tells you exactly what earns points now: read prose, bind
+relationally, pick the program from the request, compute deterministically.
+
+**How recently is `[unverified]`, and it matters more than it sounds.** No reachable source gives
+a v12 activation date: the repo's version table still labels v9–v12 "(pre-activation)" with
+nominal epochs in 2027, the score ledger that would carry the history is authenticated (see
+[Stage 0](#stage-0--reproduce-a-scored-dataset-before-writing-a-line)), and the leaderboard's
+oldest visible timestamp reflects entry refreshes rather than rollout. Since a scoring pool is
+archived on benchmark rollover, pool lifetime is the denominator of your entire business case —
+see [§12](#12-economics-and-gono-go). You cannot currently get that number.
 
 ---
 
@@ -120,10 +188,25 @@ A gzip tarball of a complete Docker build context.
 | Paths | safe relative paths only; no links, no special files |
 | Build | `docker build` must succeed with **no credentials** — screeners supply no GitHub token, no registry login, no build secret |
 | Dependencies | every dependency must be **public or vendored** |
-| Runtime | serves the protocol on **`:8080`** |
+| Runtime | serves the protocol on **`0.0.0.0:8080`** — bind the wildcard, not `127.0.0.1` |
 | Contents | no `.env`, no wallet key, no API key, no answer fixtures |
 
 Language is free — Rust, Python, TypeScript, Go, anything. **Docker is not optional.**
+
+**Two silent screening failures worth one line each.** A Flask / FastAPI / Express harness left on
+its `127.0.0.1` default is unreachable from outside the container and fails the 10 s `/health`
+gate outright — a paid failure with a one-word cause. And the request body limit: a full-size
+`/seed` body is large enough that the reference kit sets **256 MB**. `[repo]` Framework defaults
+are nowhere near — `express.json()` is 100 KB, axum's default is 2 MB, Starlette patterns cap low.
+Get this wrong and you return 413 on the first full `/seed`, seed zero pairs, and score ~0 on
+`memory_mean`, with no per-case error pointing at the cause.
+
+**Dockerfile constraints the starter kit encodes and you inherit.** `[repo]` The base images are
+digest-pinned and ONNX Runtime needs **glibc ≥ 2.38**, so swapping to a more familiar
+`bookworm-slim` produces a *link* failure that surfaces during screening, after payment. The build
+uses `--locked`, so a `Cargo.lock` left stale by adding a dependency fails fast. Rust ≥ 1.85. If
+you rewrite the `Dockerfile` — [§3.1](#31-the-fact-most-people-miss) says you may — re-check all
+four.
 
 ### 1.2 The three endpoints
 
@@ -133,8 +216,18 @@ POST /seed     →  200 {"pairs":N,"subjects":N,"links":N}
 POST /run      →  200 RunResponse
 ```
 
+The reference kit's `/health` also returns a `capabilities` array (`case_scoped_inference_v1`),
+which looks like the negotiation signal for the per-case relay path the generator describes as
+"restored". `[repo]` Whether omitting it has any effect today is **`[unverified]`** — but
+`{"status":"ok"}` is not the complete health contract the reference implementation ships.
+
 **`RunRequest`** carries `case_id`, `bench_version`, `system_prompt`, `user_input`, `tools[]`,
 and — on scored tool cases — `tool_endpoint` and `user_id`.
+
+The full `SeedRequest` shape — what `pairs`, `subjects` and `links` actually contain field by
+field — and the `tools[]` schema you must build arguments against are **not reproduced in this
+guide and are not in `PROTOCOL.md` either**. Read them off `research/dittobench-datagen/protocol`
+and off a real request captured from local practice before you design your ingest.
 
 **`RunResponse`:**
 
@@ -165,8 +258,26 @@ call within the case**.
 > "treat that like a real tool error." `[repo]` — this is expected behaviour, not a bug to work
 > around.
 
+**But do not stop there — the corollary is a scored family.** The memory tools in the supplied
+catalog are *yours to implement*. `tool_endpoint` declining them is the validator telling you it
+is not your backend, not that the call is a no-op. There is a class of write-then-read
+**`LifecycleCases`** in which one wave instructs a mutation (`save_memory`, `update_memory`,
+`delete_memory`) and a **later wave asks a question that is only answerable if the write
+landed**. `[repo]` A harness that treats the error as "absorb and move on" passes the instruction
+case superficially and then silently fails the read case.
+
+Two consequences for the architecture in [§4](#4-target-architecture): the ledger cannot be
+populated exclusively from `POST /seed`, and the write path has to land somewhere under `/tmp`,
+because everything else is read-only — see [Stage 10](#stage-10--package-verify-and-only-then-pay).
+
 On result-usage cases the validator additionally grades whether your final answer incorporates
 the value the executed tool returned (`CaseScore.result_usage`, 0–1).
+
+`RunResponse` also accepts an advisory `confidence` field, scored for calibration but never folded
+into the composite. `[repo]` Omitting it is safe. Emitting it is free — if you build the
+abstention machinery [Stage 8](#stage-8--calibrated-abstention-and-phrasing-invariance) demands
+you already have the number — and it gives you a per-case calibration signal in the report to tune
+the abstention gate against.
 
 ### 1.3 Timeouts
 
@@ -175,8 +286,20 @@ the value the executed tool returned (`CaseScore.result_usage`, 0–1).
 | `GET /health` | **10 s** | container start → healthy. Miss it and screening fails outright. |
 | `POST /run` | **60 s** | per case; a miss scores **0** for that case |
 | `POST /seed` | **5 min** | per wave |
+| **whole run** | **`[unverified]`** | every case passes, the run still misses its deadline, and you get no per-case error |
 
-Latency is *reported* (`median_ms`) but never ranked. Speed is bounded, not scored.
+**That fourth row is the one that will kill you, and its value is published nowhere** — not in
+`PROTOCOL.md`, `MINER.md`, the starter README, or the bench config. Its existence is not in doubt:
+the repo quote in [Stage 9](#stage-9--concurrency-where-runs-actually-die) describes exactly this
+failure. The scale is knowable even though the limit is not. `[live]` Every leaderboard entry carries
+`n: 351` alongside `median_ms`; `[inferred]` reading `n` as the per-run case count and the
+champion's `median_ms` of ~7.5 s as per-case latency, a serial harness needs roughly **44
+minutes** before any of your own work. Concurrency is not an optimization
+here; it is the difference between finishing and not.
+
+Latency is *reported* (`median_ms`) but never ranked. Speed is bounded, not scored — but a
+whole-run timeout is unbounded damage, so track p95 `/run` as your leading indicator against the
+60 s ceiling.
 
 ### 1.4 The three seeding tiers
 
@@ -248,16 +371,64 @@ nothing was called.
 **This means a harness tuned against local practice systematically overestimates its tool
 score.** Budget for the gap.
 
-### 2.3 The three integrity multipliers
+**Argument F1 is ~20% of your whole composite** — `0.4 × arg F1 × 0.5` — and it is the most
+mechanically winnable number on the board. `[inferred]` Note what the on-chain formula does *not*
+reward: provenance. Labelling where an argument came from (the **Recommendation** in
+[§4.4](#44-security-model--make-it-structural-not-a-blocklist)) is a security control, not an
+accuracy one; it constrains *where* a value came from and says nothing about how it is
+serialized. What moves arg F1 is dull and testable — build an argument canonicalizer, per
+[Stage 7](#stage-7--the-tool-loop-through-the-endpoint).
 
-The composite is multiplied by up to three bounded factors. Each is `1.0` when its trigger is
-absent, so accuracy stays dominant — but they are not equally forgiving.
+**Where does `result_usage` sit?** The three weights above sum to 1.0, and
+[§1.2](#12-the-three-endpoints) says `result_usage` is graded "additionally". Both statements are
+verbatim repo text and the guide cannot reconcile them for you: whether it folds into the 0.2
+trajectory term, replaces a term on those cases, or sits outside `tool_mean` entirely is
+**`[unverified]`**. It matters because you cannot price the work in Stage 7 steps 4–5 without
+knowing the weight. Measure it: run a case set with and without result integration and diff the
+reported `tool_mean`.
+
+### 2.3 The integrity multipliers
+
+The composite is multiplied by bounded factors. Each is `1.0` when its trigger is absent, so
+accuracy stays dominant — but they are not equally forgiving, and there are **four**, not three.
 
 | Factor | Range | Trigger |
 |---|---|---|
 | **Tool efficiency** | `[0.85, 1.0]` | observed-execution runs; the first extra call is free, then the over-call penalty saturates |
 | **Metamorphic consistency** | `[0.85, 1.0]` | `1 − 0.15 × (fraction of invariance families answered inconsistently)` |
 | **Canary integrity** | `1.0` / `0.85` / **`0.50`** | see below |
+| **Conversational sanity** | conjunction | greeting non-leak, declarative acknowledgement, behaviour-change application |
+
+> **The bounds in the first three rows may be two versions stale, and this is the largest
+> single uncertainty in the document.** `[unverified]` They are quoted correctly from the repo,
+> but a second public source indicates v7 moved the canary leak to **×0.25** and widened both
+> bounded factors to a 40% maximum penalty — floors of **0.60**, not 0.85. Production is v12.
+> `MINER.md` declines to publish formulas, the datagen version doc does not give them, and the
+> bench config returns nulls for integrity factors. If the floors are really 0.60, the query
+> compiler stops being a risk to manage and becomes the largest scoring exposure in your design
+> — see [Stage 6](#stage-6--deterministic-computation-not-model-arithmetic).
+
+**Conversational sanity is a scored surface this guide previously omitted entirely, and the
+architecture in [§4](#4-target-architecture) actively pushes against it.** `[repo]` It is a
+conjunction by construction, so passing the greeting slice with a canned "Got it!" cannot dilute
+failures elsewhere. The three behaviours:
+
+- **Greeting non-leak** — a harness built to aggressively retrieve on every turn answers "hi"
+  with the user's stored facts, potentially including the canary. Two failures for one reflex.
+- **Declarative acknowledgement** — the user *states* a fact. The correct action is to
+  acknowledge and store, not to answer a question that was not asked.
+- **Behaviour-change application** — the user changes a standing instruction; it must take effect.
+
+Nothing in the [§4.2](#42-layers) pipeline or the [§5](#5-build-sequence) sequence has a path for
+a non-question turn at all. Add a turn classifier ahead of retrieval. `[inferred]` Given the
+champion's `memory_mean` of 0.7271, this is plausibly a real slice of the remaining headroom.
+
+**A fifth factor exists but is currently switched off.** `[live]` The live config carries a
+token-efficiency curve — `minimum_factor: 0.85`, **`maximum_factor: 1.1`**, `bonus_cap: 0.05`,
+`curve_version: 4`, `n_min: 8` — with `active: false`, and every leaderboard entry's
+`efficiency_factor` is null. Note the direction: it is a *bonus* channel as well as a penalty, the
+only way to exceed 1.0, and it can switch on without notice. Poll `efficiency.active` before you
+tune token use for its own sake.
 
 **The canary factor is the asymmetric one.** A per-run seed-derived nonce is planted in the
 conversation and one memory case asks for it.
@@ -276,7 +447,18 @@ The canary is *also* one graded memory case inside `memory_mean`, so it costs yo
 | **Model identity** | Every miner runs the same frozen model through an attestable ticket-bound route. "If model choice were scored, the board would rank who can afford the strongest frontier model." |
 | **Latency** | "It measures hardware and model-provider speed, not harness quality." Reported as `median_ms` only. Speed is bounded instead: a timeout scores 0, over-calling hits the efficiency factor. |
 
-Put effort into the three levers that do move the score: **retrieval, the prompt, tools.**
+Put effort into the levers that do move the score — but weight them by where the headroom
+actually is, not evenly.
+
+`[live]` The champion sits at `tool_mean 0.9572` and `memory_mean 0.7271`. That is **0.1365
+composite points of memory headroom against 0.0214 of tool headroom — a factor of 6.4** — and
+every one of the current top five shows the same shape. Tools are close to solved on this board;
+memory is not.
+
+And do **not** read this section as "ignore the integrity factors." They are bounded, but the
+bound is large relative to the thing that decides the crown: a single metamorphic factor at 0.85
+costs 0.117 composite on a 0.78 base, which is **sixteen times** the 0.007 dethroning gate. The
+factors are not where you *find* points; they are where you *lose* the ones you found.
 
 ### 2.5 Dethroning and emissions
 
@@ -289,8 +471,13 @@ Put effort into the three levers that do move the score: **retrieval, the prompt
 | 5th | 4% |
 | below 5th | **0%** |
 
+- **Do not compute this yourself — it is published.** `[live]` The leaderboard's
+  `emissions.champion_defense.required_score` is the live number a challenger must beat. At the
+  verification pass it read **0.7924**, against a champion at 0.7809 — a required lead of 0.0115,
+  not the 0.007 a naive reading gives. Poll the field.
 - A challenger must clear the greater of a fixed **0.007** composite-point hysteresis and the
   statistical error band — and the band can never demand more than **twice** the 0.007 gate.
+  Confirmed live: `margin_lead: 0.007`, `statistical_lead: 0.014`, `required_lead: 0.0097`.
 - Once the incumbent exceeds **0.60** the band decays smoothly, and it is additionally capped at
   **half the headroom remaining** to a perfect score, so a perfect run always takes the crown.
 - Near-misses are settled by **re-scoring both agents on shared seeds**, not dataset luck.
@@ -300,12 +487,39 @@ Put effort into the three levers that do move the score: **retrieval, the prompt
   re-scores*, not the raw composite shown next to your entry. "The two orders usually agree and
   occasionally do not." `[repo]`
 - Evidence-tied positions pool their shares; an evidence-tied set that cannot be dethroned forms
-  an **uncapped joint crown** splitting the pool equally, possibly beyond five.
+  an **uncapped joint crown** splitting the pool equally, possibly beyond five. `[live]` **Not yet
+  active** — `tie_weighting_active: false`, gated behind `tie_weighting_required_protocol: 20`,
+  which the network has not reached. Plan as if it does not exist.
+- **Confirmation is a paired re-score, so being better is not enough — you must be measurably
+  better.** `[live]` The method is `paired` over `shared_seed_count: 15` with
+  `paired_standard_error: 0.0171`. `[inferred]` Modelling your confirmation probability as
+  `Φ((true_lead − required_lead) / SE)`: a harness at the naive 0.7879 target confirms **~44%** of
+  the time; at 0.80, **~71%**; at 0.805, **~80%**; at 0.81, **~87%**. For 90% you need a true
+  median near **0.8125**. Every failed attempt costs another evaluation fee and a cooldown.
 - 100% of miner emission flows through the competitive vector while eligible miners exist; 100%
   is burned when none are. The owner may publish a non-zero burn share that scales the whole
   vector without re-ordering it.
 - **A new score does not reach chain immediately — budget 2.5 to 4.5 hours** (two to three
   tempos) from first score to visible incentive.
+
+**The ranked number is not a median of three validators.** `[live]` That is the per-wave quorum
+(`score_count: 3 / score_quorum: 3`), and it describes screening one submission. The figure you
+are ranked and paid on is `official_composite`, whose `aggregate_method` is **`continual_mean`
+over up to 32 retained waves**. Three consequences the median model does not predict:
+
+1. Your score is **continuously re-sampled after submission** and drifts for days without you
+   resubmitting. A leaderboard entry moved 0.7537 → 0.7502 overnight during verification, with no
+   new upload.
+2. A single lucky run cannot take or hold the crown. Gate your release on a distribution whose
+   **10th percentile** clears the incumbent's continual mean — not a median that clears its
+   displayed score.
+3. **Each entry carries two different numbers** and they are not interchangeable. `composite` is
+   the raw/latest figure; `official_composite` is the continual mean, and it is the one that
+   ranks and pays. At verification the champion showed `composite: 0.804983` beside
+   `official_composite: 0.7808562`. Quoting the wrong one moves your target by 0.024.
+
+The fields that actually govern standing: `official_composite`, `composite_stderr`,
+`retained_sample_count`, `confirmation_seed_depth`.
 
 ---
 
@@ -338,13 +552,28 @@ a trained weight-predictor MLP, and an ONNX cross-encoder reranker.
 | Time to first score | hours | days-to-weeks |
 | You inherit | production retrieval engine, ranker, reranker, tool loop | nothing but the protocol |
 | You spend effort on | the gaps (canary, injection, Tier B, computation) | rebuilding the engine |
-| 20 MiB budget | fixtures already fit | cross-encoder + embeddings under 20 MiB needs care |
+| 20 MiB budget | fixtures already fit | *not the real constraint* — see [§0.1](#01-your-container-has-no-internet) |
+| Model + embedder access | already wired | **you must implement it yourself** — see below |
 | Right when | you want to compete on retrieval quality | your thesis is that the engine's *architecture* is the ceiling |
 
+> **The greenfield column carries a hazard that is easy to miss.** The model relay and embedding
+> gateway contracts in [§0.1](#01-your-container-has-no-internet) exist only in the starter kit's
+> `baseline.rs` — they are in neither `PROTOCOL.md` nor `MINER.md`. A greenfield harness that does
+> not reimplement them has **no model access and no embeddings at all**, and scores only what it
+> can do without an LLM. Read `baseline.rs` before you write a line of Python.
+
 **Recommendation:** start by forking the kit unless you have a specific, measured reason not to.
-With the champion at 0.78 and obvious headroom in retrieval, "the engine is the ceiling" is a
-strong claim to make before you have measured anything. You can always port later; the protocol
-is the only thing that is load-bearing.
+You can always port later; the protocol is the only thing that is load-bearing.
+
+Two corrections to the usual arguments for this, because the reasoning matters more than the
+conclusion. The case is **not** the 20 MiB budget — that is not binding (5.32 MiB of 20 used, and
+the cap is on the build context, not the image). The real case is two things: you inherit the
+trained MLP weights and the seven-signal composite ranker, which are *calibrated artifacts* you
+would otherwise have to reproduce; and time-to-score option value is high because the revenue
+horizon is short — see [§12](#12-economics-and-gono-go). Read the "hours" in the first row as
+*hours to first **local** score*: the only thing producing a real score is a paid on-chain
+evaluation, which [§9.5](#95-the-submission-gate--do-not-pay-until-all-of-these-are-true) tells
+you not to run until you can beat the board.
 
 Explicitly allowed:
 
@@ -481,19 +710,52 @@ before expensive ones. **Do not carry a failing gate forward.**
 
 ### Stage 0 — Reproduce a scored dataset before writing a line
 
-The generator is public and deterministic:
+The generator is public and deterministic. **You must build it first — it is a Go binary and the
+guide previously failed to say so.** `[repo]`
 
+```bash
+git clone https://github.com/ditto-assistant/ditto-subnet
+cd ditto-subnet/research/dittobench-datagen
+go build ./cmd/generate          # Go 1.23+, standard library only, no external deps
 ```
-generate -bench-version 12 -seed <seed> -run-size full -sha
+
+> **Do not follow the upstream `go install` path.** `[live]` It resolves to an *archived*
+> standalone repository with no v12 support at all — `BenchVersionV12` occurs zero times there —
+> so it silently produces a generator that rejects `-bench-version 12`. The datagen README is
+> stale in both copies: it says generation supports "v2 through the pre-activation v10 contract"
+> and its SHA-256 vector table stops at v10, so you are told twice that v12 is unavailable while
+> the monorepo code supports it.
+
+Then generate:
+
+```bash
+./generate -bench-version 12 -seed 123456789 -run-size full -sha
 ```
 
 > "reproduces any scored run's exact bytes and dataset_sha256" `[repo/api]`
 
-Pull a published seed from the score ledger, regenerate it, and **read the cases by hand** — the
-memory families, the four query programs, the injection markers, the tool trajectories, the
-planted distractors.
+**You do not need a seed from a scored run, and you cannot get one.** `[live]` The score ledger is
+at `ledger_path` in the bench config (`/api/v1/scoring/scores`) and it is validator-authenticated
+— it returns `401 {"message":"validator authentication failed"}` to a miner. Both
+`public_transcript_url_template` and `public_mirror_url_template` are currently `null`, so no
+scored run's seed or transcript is retrievable by you. (This also qualifies the auditability claim
+in [§11](#11-the-cheating-boundary): the mechanism is designed, but the public endpoints are not
+currently serving.)
 
-> **GATE** — you can name every scored question family and point at a concrete example of each.
+None of that matters, because the generator is deterministic and **any seed samples the same
+distribution**. Use the canonical public full-profile seed `123456789`, which the datagen README
+documents with CI-asserted SHA-256 vectors; or run `generate -bench-version 12 -run-size small`,
+which prints a fresh random seed on stderr. Generate several and read across them.
+
+Now **read the cases by hand** — the memory families, the four query programs, the injection
+markers, the tool trajectories, the planted distractors.
+
+> **GATE** — you can name every scored question family and point at a concrete example of each,
+> from datasets you generated yourself.
+
+Note the gate says *name the families you can observe*, not *recover the generator's labels*:
+[§1.5](#15-opaque-identifiers--a-real-trap) says question/family/category labels are deliberately
+absent from the wire. You are building your own taxonomy from the cases, which is the point.
 
 *Why first:* you are about to spend weeks optimizing against this distribution. An afternoon
 reading it is the highest-leverage hour in the project.
@@ -627,8 +889,31 @@ compute outside it.
 Reject any extracted claim whose cited raw span does not support it. Allow one bounded repair
 attempt for malformed structured output.
 
+**The repair attempt fixes the easy failure. Budget for the hard one.** `[inferred]` Schema-
+*invalid* output is cheap to handle — at a realistic 3–10% malformed rate, one independent repair
+drives the residual to ~0.1–1%. The dangerous case is schema-**valid and semantically wrong**: the
+compiler emitting `operators: ["subtract"]` where the request implies *larger-minus-settled*. That
+failure is silent, it produces a confident wrong answer, and it is the **only component in the
+whole design that manufactures metamorphic inconsistency** — because the consistency factor
+re-asks the same question paraphrased, and a stochastic compiler that flips program between a base
+case and its twin fails exactly the thing being measured.
+
+Price it with the formula in [§2.3](#23-the-integrity-multipliers): a 10% program-flip rate gives
+`1 − 0.15 × 0.10 = 0.985`, i.e. **−0.012 composite** on a 0.80 base — 1.7× the dethroning gate. If
+the floors are really 0.60 rather than 0.85, roughly triple that.
+
+So give the compiler a consistency mechanism, not just a repair path:
+
+- **Cache the compiled program by semantic key**, not by question string — normalized entities,
+  operators and answer type — so paraphrases of one question resolve to one program by
+  construction.
+- **Self-consistency sample** the compile step (3 draws, majority program, deterministic
+  tie-break) on any request whose first compile is low-confidence.
+- **Assert program stability** in testing: compile each question and its paraphrases, and fail the
+  build on disagreement. This is cheap — it needs no scoring run.
+
 > **GATE** — every computed answer traces to source spans; changing the sampled program shape
-> changes the answer correctly.
+> changes the answer correctly; and paraphrases of one question compile to one program.
 
 ---
 
@@ -642,9 +927,29 @@ attempt for malformed structured output.
 6. Avoid unnecessary calls — the efficiency factor is watching
 7. Treat the memory-tool error response as a real tool error
 8. Bound the loop (the stock kit allows **24 model turns** as a guardrail, "not a scoring cap" —
-   and miners may tune it)
+   and miners may tune it). Note the interaction with the whole-run deadline in
+   [§1.3](#13-timeouts): 24 turns at gpt-oss-20b medium-effort latency can exceed the 60 s case
+   ceiling on its own, so the guardrail is not a safe default — tune it *down* against measured
+   p95, not up.
 
-> **GATE** — `observed_tool_cases` equals the scored tool case count; `capped_tool_cases` is zero.
+**Build an argument canonicalizer.** `[inferred]` Argument F1 is ~20% of the composite
+([§2.2](#22-tool-grading--on-chain-differs-from-local)) and it is lost to serialization, not to
+reasoning. One normalization pass, with a golden-file test per tool schema:
+
+- **byte-exact echo** of every opaque identifier — round-trip them through your JSON layer and
+  assert equality; a serializer that re-types or reorders silently costs you the case
+- **numeric type discipline** — `3418` vs `"3418"` vs `"3,418"` are three different answers
+- **unit and currency normalization**, decided once and applied everywhere
+- **canonical key ordering**, and **omit** optional keys the schema does not require rather than
+  emitting `null`
+- **whitespace and casing** normalization on free-text arguments
+
+Measure name F1 and argument F1 *separately* in local practice. A combined tool score hides which
+of the two is failing, and they have completely different fixes.
+
+> **GATE** — `observed_tool_cases` equals the scored tool case count; `capped_tool_cases` is zero
+> or understood ([§0.2](#02-the-trajectory-that-is-graded-is-the-one-the-validator-observed));
+> argument F1 tracked as its own number.
 
 ---
 
@@ -694,6 +999,12 @@ And: re-check what your `bench_version` gates actually enable.
 > the next one. Diff the per-request work your agent does across versions **before** you submit,
 > not after a run times out." `[repo]`
 
+Size the problem before you tune it. `[live]` Every leaderboard entry reports `n: 351` and a
+`median_ms` (~7.5 s for the champion). `[inferred]` If `n` is the per-run case count, that is
+about **44 minutes of serial latency** before any of your own work — confirm it against your own
+`--run-size full` report rather than taking the reading on trust. The whole-run deadline is unpublished ([§1.3](#13-timeouts)), so treat aggregate
+throughput, not per-case latency, as the quantity you are engineering.
+
 > **GATE** — a full-size run under concurrency shows zero timeouts, repeatedly.
 
 ---
@@ -703,9 +1014,25 @@ And: re-check what your `bench_version` gates actually enable.
 Build the image from a clean context and re-run the entire contract against the **container**,
 not the source process.
 
-Verify: no host mounts, no `.env` inside, config read from environment, writable database path,
-non-root user, no private-credential dependency, no secret in any layer, concurrent cases do not
-deadlock, CPU work does not block async handling.
+**Know the box you are shipping into.** `[repo]` Neither the protocol docs nor earlier revisions
+of this guide stated it, and "writable database path, non-root user" badly undersells it:
+
+| Constraint | Consequence |
+|---|---|
+| **Root filesystem is read-only** | Every path except `/tmp` fails with `EROFS` at runtime |
+| **Only `/tmp` is writable, and it is a tmpfs** | Anything you build there consumes the RAM allowance and does **not** persist between runs |
+| **Runs as uid 65532** | Non-root is enforced, not advisory |
+
+What that catches, concretely: your SQLite/Turso file, any lexical or BM25 index you build during
+`/seed`, tokenizer and HuggingFace caches (`HF_HOME`, `TRANSFORMERS_CACHE`, `~/.cache`), ONNX
+Runtime's temp extraction, and any log file. All of it must be redirected under `/tmp`. Note the
+starter kit's own code default is `./dittobench.db` relative to `/app` — which would fail; only
+the Dockerfile's `ENV DITTOBENCH_DB=/tmp/dittobench.db` saves it. A greenfield harness that writes
+anywhere else dies on the first `/seed`.
+
+Verify: no host mounts, no `.env` inside, config read from environment, **every write path under
+`/tmp`**, non-root user, no private-credential dependency, no secret in any layer, concurrent
+cases do not deadlock, CPU work does not block async handling.
 
 > **GATE** — every gate above green, on the built image, across multiple unseen seeds.
 
@@ -744,13 +1071,27 @@ text as data.
 | `cargo test` | your invariants: idempotent seeding, version chains, tombstones, decimal arithmetic, namespace isolation | anything about score |
 | `curl` the three endpoints | wire conformance, well-formed responses | retrieval or reasoning quality |
 | `cargo run -- mem-eval --k 10` | retrieval recall per question type, fast, no chat model | that the agent selects the right evidence or answers from it |
-| `cargo run -- evaluate` | A/B on fixed inputs — cheapest signal a change helped. *"Use `evaluate` to develop."* `[repo]` | generalization; optimizing it directly **is** overfitting |
-| `cargo run -- practice --n 20` | rotating wording from a small template pool | substance — "It varies wording, not substance, and never exercises the seeding tiers/waves." `[repo]` |
+| `cargo run -- evaluate` | A/B on fixed inputs — cheapest signal a change helped. *"Use `evaluate` to develop."* `[repo]` | **anything about v12** — it generates **bench_version 9** datasets; also generalization |
+| `cargo run -- practice --n 20` | rotating wording from a small template pool | **anything about v12** (same v9 path); substance — "It varies wording, not substance, and never exercises the seeding tiers/waves." `[repo]` |
 | `uv run ditto practice --run-size small\|medium\|full` | the **real** generator + deterministic scorer, staged seeding, graph isolation, and a reachable validator-owned `tool_endpoint` | the screened image; it still uses your `.env` model, and local practice lags production's bench version |
 | Hosted rehearsal | reachability and hosted orchestration | tool score — a publicly tunnelled harness cannot reach the hosted scorer's loopback tool endpoint, so cases come back `capped` |
 | `docker build --no-cache` + contract replay | the artifact validators will actually run behaves like what you tested | score |
 | `uv run ditto verify` | archive rules: gzip, ≤20 MiB, root Dockerfile, safe paths, no links | that it builds, runs, or scores |
-| **On-chain evaluation** | **everything.** Up to three independent validators run the screened image; the median is finalized | — |
+| **On-chain evaluation** | **everything.** Up to three validators run the screened image per wave; the board then aggregates a `continual_mean` over retained waves ([§2.5](#25-dethroning-and-emissions)) | — |
+
+> **Your tightest feedback loop is blind to the thing you are being scored on.** `[repo]`
+> `evaluate` and `practice` run **bench_version 9** — `protocol.rs` pins the generated version
+> even though `MAX_SUPPORTED_BENCH_VERSION` is 12, so the kit *accepts* v12 requests while
+> *generating* v9 ones. Every v12 lever in [§6](#6-what-dittobench-v12-punishes) — prose-only
+> amounts, Fisher–Yates shuffling, removed format tells, relational subject binding, the
+> rebalanced larger-minus-settled shape, compositional injection banks — is **absent** from what
+> you are iterating against. Nothing errors; you simply optimize the wrong distribution, and a
+> change that helps on v9 can be neutral or harmful on v12.
+>
+> Use `evaluate` for what it is genuinely good at — regression-checking your own invariants and
+> refactors — and do all v12 tuning against `uv run ditto practice` or datasets you generate
+> yourself in [Stage 0](#stage-0--reproduce-a-scored-dataset-before-writing-a-line). Confirm the
+> `bench_version` in every report before you believe a number.
 
 ### 7.2 Reading the report
 
@@ -770,8 +1111,10 @@ Then, in order:
 
 ### 7.3 Distribution, not a point estimate
 
-Up to three validators score you and the **median** is finalized. What matters is your median
-and your floor.
+Up to three validators score you per wave; the published figure is a `continual_mean` over
+retained waves ([§2.5](#25-dethroning-and-emissions)). What matters is your median and your
+floor — and because confirmation is a **paired** re-score with SE ≈ 0.017, your floor matters more
+than your median.
 
 ```
 0.81, 0.80, 0.79, 0.80, 0.78     ← submission-ready
@@ -779,14 +1122,31 @@ and your floor.
 ```
 
 Vary seeds to measure **dataset robustness**; repeat a seed to measure **your own variance**.
-A practical release test: ~20 small runs on different seeds, ~10 medium, 5–10 full if inference
-cost permits, plus three repeats of one seed.
+A practical release test: ~20 small runs on different seeds, ~10 medium, 5–10 full, plus three
+repeats of one seed.
+
+**"If inference cost permits" is now answerable, and the answer is that it always permits.**
+`[live]` The leaderboard publishes `average_run_cost_microusd` per entry; across the current top
+five it ranges 192,866–417,574, i.e. **$0.19–$0.42 of inference per full run**. Ten full practice
+runs is a few dollars, not a budget decision. This inverts the usual advice in
+[§8](#8-environment-setup): the "free" local Ollama path trades days of wall clock to save a
+handful of dollars. Use the hosted key and run more seeds.
 
 Track median, minimum, P10, standard deviation, failure rate.
 
-**Recommendation:** with the leader at ~0.78, do not submit because one local run hit 0.785. Aim
-for a repeatable **0.80+ median across many unseen full seeds** with a strong lower percentile —
-and remember the local tool scorer reads high (§2.2).
+**Recommendation:** do not submit because one local run cleared the champion. Derive the target
+from the live field, not from a rule of thumb:
+
+```
+target  =  emissions.champion_defense.required_score  +  1.28 × your own paired SE
+```
+
+`[live]` At the verification pass `required_score` was **0.7924** and the platform's paired SE was
+0.0171, which puts a 90%-confidence target near **0.8125** — not the 0.80 an earlier revision of
+this guide recommended, and not the 0.7879 that "leader + 0.007" gives. Aim there, across many
+unseen full seeds, with a strong lower percentile — and remember the local tool scorer reads high
+([§2.2](#22-tool-grading--on-chain-differs-from-local)) and that `evaluate`/`practice` are on v9
+([§7.1](#71-the-ladder)).
 
 ### 7.4 Build your own adversarial bank
 
@@ -864,6 +1224,15 @@ Keep `embeddinggemma` on Ollama for memory indexing. **Keep the model at
 `openai/gpt-oss-20b`** so practice tracks scoring — a stronger local model makes your harness
 look better than it will score.
 
+**Recommendation — take this path, not the free one.** `[inferred]` On the measured per-run cost
+in [§7.3](#73-distribution-not-a-point-estimate), a full 32-seed release sweep is single-digit
+dollars. Running the 20B locally to avoid that trades 1.5–4.5 days of wall clock for roughly $5.
+Use Ollama for `mem-eval` and unit work, where no chat model is needed at all, and put the hosted
+key on everything that runs the agent loop.
+
+Note also that one documented command hard-requires the key: `--longmem-eval`
+([Appendix A](#appendix-a--command-reference)) will not run on the Ollama-only path.
+
 > An `OPENAI_API_KEY` is **not** required by the official workflow at any point.
 
 `cargo build` and `cargo test` need no model or embedder, but the first build needs network (the
@@ -928,6 +1297,15 @@ reservation gives that coldkey an **exclusive 15-minute slot**, preventing concu
 transfers) → displays live pricing → asks for confirmation → pays on chain → uploads the signed
 archive → prints the agent ID.
 
+**Registration, which this guide previously assumed you had already solved.** `[repo]` You need a
+hotkey registered on netuid 118 before any of the above. `upload` will now do it for you with
+`--register` (and `--no-register` restores the old failing pre-check), which changes the flow
+above — read the prompts rather than assuming the steps. Two things to budget for that
+[§12](#12-economics-and-gono-go)'s table understates: registration TAO is **burned and
+non-refundable** even if you never submit or you score zero, and it is **usually larger than the
+0.04 TAO evaluation fee** the table foregrounds. The live cost is dynamic and was
+**`[unverified]`** at the verification pass — quote it from the CLI before you commit.
+
 Use `-y` only for intentional automation accepting the live TAO fee without confirmation.
 
 **If upload fails after payment:** the CLI saves a finalized payment proof locally before
@@ -989,6 +1367,14 @@ Then budget **2.5–4.5 hours** for the score to reach chain as visible incentiv
 | **Reading identifiers** | Opaque capabilities. Compare for equality only. |
 | **Shipping secrets** | The tarball is uploaded. |
 | **Comparing to the leaderboard across versions** | If `bench_version` differs, the numbers are not comparable. |
+| **Developing against `evaluate`/`practice`** | They generate **v9**. Every v12 lever you are scored on is absent. §7.1. |
+| **Writing outside `/tmp`** | Root filesystem is read-only at scoring time. Stage 10. |
+| **Default request body limits** | A full `/seed` is large; the kit sets 256 MB. A 413 costs the whole memory half. §1.1. |
+| **Binding `127.0.0.1`** | Unreachable from outside the container; fails the 10 s `/health` gate. §1.1. |
+| **Greenfield without reading `baseline.rs`** | The model relay and embedder contracts are documented nowhere else. §0.1. |
+| **Quoting `composite` instead of `official_composite`** | Two different numbers per entry; only one ranks and pays. §2.5. |
+| **Treating memory-tool errors as no-ops** | Write-then-read `LifecycleCases` need the write to land. §1.2. |
+| **Retrieving on every turn** | Greetings leak stored facts and fail the conversational-sanity factor. §2.3. |
 
 ---
 
@@ -1008,32 +1394,106 @@ hotkey-level ban.
 
 **Allowed:** forking, replacing, or heavily optimizing the public starter harness.
 
-**Auditability cuts both ways.** Scores, signatures and each run's graded transcript are
-published so anyone can regenerate the dataset from the published seed, re-run the public grader
-over the transcript, and check the numbers match the signed composite. Your work is checkable —
-and so is everyone else's.
+**Auditability cuts both ways — in design.** Scores, signatures and each run's graded transcript
+are published so anyone can regenerate the dataset from the published seed, re-run the public
+grader over the transcript, and check the numbers match the signed composite. Your work is
+checkable — and so is everyone else's.
+
+> **In practice, the public half of that is not currently serving.** `[live]` The score ledger
+> returns `401` to a miner, and the bench config's `public_transcript_url_template` and
+> `public_mirror_url_template` are both `null`. So you can regenerate any dataset you like
+> ([Stage 0](#stage-0--reproduce-a-scored-dataset-before-writing-a-line)), but you cannot
+> currently fetch a scored run's seed or transcript to check anyone's number — including your
+> own. Re-check those two fields before relying on the audit path.
 
 ---
 
 ## 12. Economics and go/no-go
 
-| Metric | Value (2026-09-02) |
-|---|---|
-| Rank-1 share of miner emission | **65%** |
-| Subnet emission | ~0.241% of network (~2,412,246 rao/block), rank 43 |
-| Active miners | **5** of 256 registered UIDs |
-| Validators | 11 |
-| Subnet market cap | ~25,482 TAO |
-| Alpha price | ~0.0098 TAO |
-| Evaluation fee | 0.04 TAO (40,000,000 rao) — operator-configurable; the CLI shows the live figure |
-| Registration | dynamic; recycled/burned, separate from the eval fee |
-| Current top score | 0.780856 (`aceron_v13`) |
-| Fifth place | 0.713743 (`Hogwarts_v5`) |
-| Scored miners | 37 |
+> **Every figure below moves.** They are stamped, not stable. Re-read the leaderboard and the
+> chain before you act on any of them; the ones in this table were 3.2–3.6% off within 24 hours
+> of being written the first time.
 
-**The honest read.** Only five active miners means the top five is genuinely reachable — this is
-not a crowded board. It also means the subnet is small: 0.241% of network emission across a
-~25.5k TAO cap. Price the expected return before committing weeks of engineering, not after.
+| Metric | Value | Read |
+|---|---|---|
+| Rank-1 share of *miner* emission | **65%** | `[live]` `rank_shares: [0.65, 0.14, 0.10, 0.07, 0.04]` |
+| **Miner share of subnet emission** | **41%** | dTAO split: 41% miners / 41% validators+stakers / 18% owner |
+| Subnet alpha emission | 1.000 α/block | `[live]` `alpha_out_emission` |
+| Subnet TAO inflow | ~2,337,530 rao/block | `[live]` `tao_in_emission`; ~0.233% of network |
+| Alpha spot | ~0.0095 TAO | `[live]` `tao_in_emission / alpha_in_emission` |
+| Paid slots | **5**, by construction | not a measure of competition — see below |
+| Emission-eligible v12 competitors | **40** | `[live]` all finalized, all registered |
+| Validators | 11 | `[live]` |
+| Evaluation fee | 0.04 TAO (40,000,000 rao) | operator-configurable; the CLI shows the live figure |
+| Registration | dynamic; burned, non-refundable, **usually > the eval fee** | see [§9.3](#93-submit) |
+| Inference cost | **$0.19–$0.42 per full run** | `[live]` `average_run_cost_microusd` |
+| Champion `official_composite` | 0.780856 (`aceron_v13`) | `[live]` |
+| **Dethrone target** | **0.7924** | `[live]` `champion_defense.required_score` |
+| Fifth place | 0.733684 (`lets_v610`) | `[live]` — the paid-slot floor |
+
+### 12.1 What a rewarded position actually pays
+
+`[inferred]` from the live chain figures above. The 41% miner share is the step an earlier
+revision of this guide omitted. Without it the obvious calculation is
+`0.00233753 τ/block × 7200 × 0.65 = 11.29 τ/day` — wrong twice over: it drops the miner share, and
+it works in the TAO-inflow denomination rather than the alpha miners are actually paid in.
+
+```
+7,200 blocks/day × 1.000 α/block × 0.41 miner share  =  2,952 α/day to miners
+
+  rank 1   × 0.65  =  1,918.8 α/day  ≈  18.23 τ/day     (at ~0.0095 τ/α)
+  rank 2   × 0.14  =    413.3 α/day  ≈   3.93 τ/day
+  rank 5   × 0.04  =    118.1 α/day  ≈   1.12 τ/day
+  below 5th        =      0
+```
+
+Two caveats that matter more than the precision. This is **mark-to-market in alpha**, not TAO
+received: the subnet absorbs materially less real TAO per day than it issues alpha, so the exit
+price is not the spot price at any size. And the 65/14/10/7/4 curve is brutally convex — **rank 1
+earns 16× rank 5.**
+
+### 12.2 Break-even
+
+The guide previously told you to "price the expected return" and then gave you no prices. Here is
+the arithmetic; substitute your own rates.
+
+**Cost.** Scoping [§5](#5-build-sequence)'s stages honestly — S0 1d, S1 2d, S2 3d, S3 5d, S4 4d,
+S5 2d, S6 6d, S7 3d, S8 3d, S9 2d, S10 2d — is **33 engineer-days as a floor**, before
+[§7.4](#74-build-your-own-adversarial-bank)'s adversarial bank, [§7.5](#75-two-distribution-shifts-you-must-plan-for)'s
+MLP retrain for the Perplexity embedding space, and [Appendix B](#appendix-b--metrics-dashboard)'s
+nine-rung ablation ladder on held-out seeds. Call it **50 days** realistically. Cash costs are
+negligible against that: ~20 uploads × 0.04 TAO, registration, and single-digit dollars of
+inference.
+
+**Revenue horizon.** This is the number that decides it, and it is the one you cannot get.
+`[live]` `available_bench_versions` lists **eleven** prior pools (v2–v12), and a benchmark rollover
+**archives the scoring pool** — the clause [§12](#12-economics-and-gono-go) previously buried in a
+subordinate sentence. `[unverified]` No source gives v12's activation date or expected lifetime
+(see [§0.5](#05-the-board-reset-because-an-exploit-was-closed-not-because-the-problem-is-unsolved)),
+so you are underwriting a 50-day build against a pool of unknown and plausibly shorter duration.
+
+**The conclusion follows mechanically.** Over any short pool, rank 5 at ~1.12 τ/day does not repay
+a 50-day build under any reasonable day rate. Rank 1 at ~18.23 τ/day does. **This is a
+rank-1-or-nothing bet**, and it should be priced as one.
+
+### 12.3 The honest read
+
+**"Only five active miners" is not a measure of competition, and reading it as one inverts the
+decision.** `[live]` The chain reports `active_miners = 5`, and that is real — but SN118 pays
+65/14/10/7/4 to exactly five slots and nothing below, so the count of UIDs carrying non-zero
+incentive is **pinned at 5 by construction**, no matter how many people are competing. The actual
+field is the **40 finalized, registered, emission-eligible v12 entries**, of which **35 currently
+earn nothing** while paying evaluation fees. The board is roughly eight times more crowded than
+that number suggests.
+
+The incumbents are also moving. Between two consecutive daily reads the board gained entries, a
+miner absent from every prior snapshot (`kaelith`) took rank 4, and the previous fifth place was
+pushed out of the paid set — while itself improving. You are not aiming at a stationary target.
+
+Against that: the paid-slot floor is 0.7337 and the crown is 0.7924, on a benchmark whose ceiling
+is 1.0 and whose champion still leaves 0.1365 of memory headroom
+([§2.4](#24-what-is-deliberately-not-scored)). The problem is genuinely unfinished. Just price the
+bet as rank-1-or-nothing, over a pool of unknown lifetime, before committing weeks — not after.
 
 **What is *not* required:** daily submissions, a running server, a GPU, or any model API key.
 Once an artifact holds a rewarded position, its score keeps earning until another miner displaces
@@ -1062,6 +1522,17 @@ cargo run -- serve --port 8080           # serve the harness
 cargo run -- playground                  # interactive chat + hosted Submit tab
 cargo run -- submit                      # → dittobench-submission.tgz
 ```
+
+### Dataset generation (monorepo root) — build it first, it is Go
+
+```bash
+cd research/dittobench-datagen && go build ./cmd/generate    # Go 1.23+, stdlib only
+./generate -bench-version 12 -seed 123456789 -run-size full -sha
+./generate -bench-version 12 -run-size small                 # prints a fresh seed on stderr
+```
+
+Do **not** `go install` from the archived standalone repo — it has no v12 support. See
+[Stage 0](#stage-0--reproduce-a-scored-dataset-before-writing-a-line).
 
 ### Production-shaped practice (monorepo root)
 
@@ -1105,6 +1576,30 @@ curl https://platform-api.heyditto.ai/api/v1/public/bench/config
 curl https://dittobench.ai/api/v1/public/leaderboard
 ```
 
+The four fields worth pulling out of the leaderboard every time:
+
+```bash
+L=https://dittobench.ai/api/v1/public/leaderboard
+
+# the number you must beat — do not compute it yourself
+curl -s $L | jq '.emissions.champion_defense
+                 | {required_score, required_lead, paired_standard_error, shared_seed_count}'
+
+# the paid-slot floor, and the two-numbers-per-entry trap
+curl -s $L | jq '.entries[:6] | map({rank, agent_name,
+                 official_composite, composite, tool_mean, memory_mean})'
+
+# how crowded it actually is, and what a full run costs to practise
+curl -s $L | jq '{count, eligible: [.entries[]|select(.emission_eligible)]|length,
+                  cost_usd: ([.entries[:5][].average_run_cost_microusd]|add/5/1e6)}'
+
+# is the token-efficiency factor live yet?
+curl -s $L | jq '.efficiency | {active, minimum_factor, maximum_factor, bonus_cap}'
+```
+
+The score ledger (`/api/v1/scoring/scores`, named in the bench config's `ledger_path`) is
+validator-authenticated and returns `401` to a miner. Do not build a workflow on it.
+
 ---
 
 ## Appendix B — metrics dashboard
@@ -1113,7 +1608,8 @@ Track every one of these per release candidate, across many seeds.
 
 | Metric | Target |
 |---|---:|
-| Median composite (full runs) | above current leader **+ 0.007** |
+| Median composite (full runs) | **`required_score` + 1.28 × your paired SE** (~0.8125 at verification) |
+| P10 composite | above the incumbent's `official_composite` |
 | Worst-seed composite / P10 | close to the median |
 | `tool_mean` | high and stable |
 | `memory_mean` | high and stable |
@@ -1130,6 +1626,10 @@ Track every one of these per release candidate, across many seeds.
 | Unnecessary tool calls | minimal (efficiency factor at 1.0) |
 | `transform_robustness` / consistency factor | **1.0** |
 | Canary integrity factor | **1.0** |
+| Conversational-sanity factor | **1.0** |
+| Tool-name F1 / **argument F1** | tracked **separately**, never as one number |
+| Program stability across paraphrases | **100%** (compile-time check, no scoring run needed) |
+| p95 `/run` latency | well under 60 s — the leading indicator for the whole-run deadline |
 
 ### Suggested ablation ladder
 
@@ -1172,6 +1672,11 @@ F1, argument F1, trajectory credit, consistency, token use, p95 latency.
    compatibility only.
 4. Expect the reasoning-effort lever described in `MINER.md` to be inert under the current
    enforcement.
+5. **The drift runs both ways, and the code is ahead of the prose.** `[repo]` The kit's
+   `protocol.rs` sets `MAX_SUPPORTED_BENCH_VERSION = 12`, so the harness *accepts* v12 requests
+   while the same file pins `evaluate`/`practice` generation at **v9** and the READMEs still say
+   v8. So "the repo is behind" is too simple: read the constants, not the prose, and check what
+   each command actually emits. See [§7.1](#71-the-ladder).
 
 ---
 
@@ -1188,7 +1693,53 @@ Read directly on 2026-09-02:
 - `https://dittobench.ai/api/v1/public/leaderboard`
 - taostats, taomarketcap, backprop.finance, learnbittensor — netuid 118 identity and economics
 
+Re-verified live on 2026-09-02 at 21:55–21:57 UTC:
+
+- `platform-api.heyditto.ai/api/v1/public/bench/config` — 200
+- `dittobench.ai/api/v1/public/leaderboard` — 200, `count: 40`
+- `platform-api.heyditto.ai/api/v1/scoring/scores` — **401**, validator-authenticated
+- all 29 arXiv identifiers underlying the research synthesis this guide derives from — resolved,
+  none fabricated
+
 **Note on netuid 118's history:** the netuid registered 2025-06-06 as *HODL*, the mobiusfund ETF
-subnet, and was rebranded to Ditto around April 2026. Its on-chain identity today is
+subnet, and was rebranded to Ditto around April 2026 (`[unverified]` — the registration date is
+confirmed on-chain and the mobiusfund provenance is confirmed, but no reachable source states a
+rebrand date; it is inferred from repository timestamps). Its on-chain identity today is
 `name: "Ditto"`, `description: "Open-Source Claude Cowork"`, owner contact `peyton@omniaura.ai`
-(Omni Aura). Nothing about the netuid's 2025 history belongs to Ditto.
+(Omni Aura). Nothing about the netuid's 2025 history belongs to Ditto. Third-party directories are
+still split — some aggregators serve stale "SN118 — HODL ETF" titles over Ditto content, so treat
+any aggregator page for this netuid with suspicion.
+
+---
+
+## Appendix E — what the verification pass changed
+
+Recorded so that a reader who saw an earlier revision knows which of their conclusions to discard.
+Ordered by cost of having believed the old version.
+
+| Was | Now | Basis |
+|---|---|---|
+| "Exactly two holes" in the egress boundary | **Three** — the embedding gateway over `OLLAMA_BASE_URL`, in Ollama wire format | `[repo]` |
+| Model relay mentioned, never specified | Full contract: `DITTOBENCH_PROVIDER=platform`, `DITTOBENCH_INFERENCE_BASE_URL`, OpenAI-compatible, `Bearer ticket` | `[repo]` |
+| Stage 0: "pull a published seed from the score ledger" | Ledger is `401`; build the Go generator and use seed `123456789` | `[live]` |
+| "writable database path, non-root user" | Read-only rootfs, `/tmp` tmpfs only, uid 65532 | `[repo]` |
+| Appendix B target: leader **+ 0.007** = 0.7879 | Live `required_score` **0.7924**, + 1.28 × paired SE ⇒ ~0.8125 | `[live]` |
+| "Three integrity multipliers" | **Four**, plus a switched-off fifth whose max is **1.1** | `[live]` |
+| Median of up to three validators is finalized | `continual_mean` over up to 32 retained waves | `[live]` |
+| 37 scored miners; 5th = 0.713743 (`Hogwarts_v5`) | **40**; 5th = **0.733684** (`lets_v610`); `kaelith` at rank 4 | `[live]` |
+| "Only five active miners — not a crowded board" | 5 is the number of **paid slots**; 40 agents contest them | `[live]` |
+| §12 gives chain figures, no revenue or break-even | 41% miner share added; rank 1 ≈ 18.23 τ/day, rank 5 ≈ 1.12 τ/day; rank-1-or-nothing | `[inferred]` |
+| §12 figures to 7 significant digits | All were 3.2–3.6% high within a day; precision reduced and marked | `[live]` |
+| `evaluate` / `practice` presented as the dev loop | They generate **v9** — blind to every v12 lever in §6 | `[repo]` |
+| Memory-tool errors: "expected behaviour" | Also: memory tools are **yours to implement**; `LifecycleCases` need the write to land | `[repo]` |
+| Conversational sanity, `n: 351`, whole-run deadline | Absent entirely; now stated (the deadline value remains `[unverified]`) | `[live]` |
+| "Free" Ollama path recommended for testing | A full run costs $0.19–$0.42; use the hosted key | `[live]` |
+| 20 MiB framed as the binding constraint | 5.32 MiB used of 20; the runtime box is the real envelope | `[repo]` |
+| 29 `[repo]` markers, 3 Recommendations, ~700 lines unmarked | Four-state provenance convention, applied | — |
+
+Two things the pass **confirmed** that are easy to doubt: every `[repo]`/`[repo/api]` quotation
+spot-checked appears verbatim at its cited path, and the whole bench-config block is
+character-for-character correct. And §2.5's subtle claim — that paid slots follow the settling
+mean rather than the raw composite — is live-confirmed: the `raw_rank` field currently reads
+`1, 4, 5, 2, 3` against payout shares `0.65, 0.14, 0.10, 0.07, 0.04`. The two orders disagree
+right now.

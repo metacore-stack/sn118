@@ -1,0 +1,9 @@
+tests/
+*.db
+*.db-*
+*.tgz
+.env
+.env.*
+__pycache__/
+*.pyc
+STATUS.md
